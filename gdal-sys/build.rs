@@ -49,6 +49,8 @@ pub fn write_bindings(include_paths: Vec<String>, out_path: &Path) {
             format!("{}-{}", os, host_parts[0])
         };
 
+        eprintln!("Running on host {}", host_tag);
+
         let llvm_bindir = format!(
             "{}/toolchains/llvm/prebuilt/{}/bin",
             ndk_path, host_tag
