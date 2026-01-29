@@ -47,8 +47,14 @@ pub fn write_bindings(include_paths: Vec<String>, out_path: &Path) {
 
         let host_tag = if os == "macos" {
             if arch == "aarch64" || arch == "arm64" {
-                let arm64_path = format!("{}/toolchains/llvm/prebuilt/darwin-aarch64", ndk_path);
-                if Path::new(&arm64_path).exists() {
+                let ndk_base = PathBuf::from(&ndk_path);
+                let arm64_path = ndk_base
+                    .join("toolchains")
+                    .join("llvm")
+                    .join("prebuilt")
+                    .join("darwin-aarch64");
+
+                if arm64_path.exists() {
                     "darwin-aarch64".to_string()
                 } else {
                     eprintln!("Warning: Using x86_64 NDK toolchain on Apple Silicon (Rosetta 2 required)");
@@ -63,24 +69,26 @@ pub fn write_bindings(include_paths: Vec<String>, out_path: &Path) {
 
         eprintln!("Running on host {}", host_tag);
 
-        let llvm_bindir = format!(
-            "{}/toolchains/llvm/prebuilt/{}/bin",
-            ndk_path, host_tag
-        );
-        let sysroot_base = format!(
-            "{}/toolchains/llvm/prebuilt/{}",
-            ndk_path, host_tag
-        );
+        let ndk_base = PathBuf::from(&ndk_path);
+        let sysroot_base = ndk_base
+            .join("toolchains")
+            .join("llvm")
+            .join("prebuilt")
+            .join(&host_tag);
 
-        if !Path::new(&sysroot_base).exists() {
+        if !sysroot_base.exists() {
             panic!(
                 "NDK toolchain not found at: {}\nPlease check your ANDROID_NDK_HOME/ANDROID_NDK path and host architecture.",
-                sysroot_base
+                sysroot_base.display()
             );
         }
 
-        println!("cargo:rustc-env=LIBCLANG_PATH={}", llvm_bindir);
-        println!("cargo:rustc-env=CLANG_PATH={}", llvm_bindir);
+        let llvm_bindir = sysroot_base.join("bin");
+        let clang_ext = if cfg!(windows) { ".exe" } else { "" };
+        let clang_path = llvm_bindir.join(format!("clang{}", clang_ext));
+
+        println!("cargo:rustc-env=LIBCLANG_PATH={}", llvm_bindir.display());
+        println!("cargo:rustc-env=CLANG_PATH={}", clang_path.display());
         println!("cargo:rerun-if-changed=wrapper.h");
 
         let (clang_target, include_target) = match target.as_str() {
@@ -91,39 +99,59 @@ pub fn write_bindings(include_paths: Vec<String>, out_path: &Path) {
             _ => panic!("Unsupported Android target: {}", target),
         };
 
-        let sysroot = format!("{}/sysroot", sysroot_base);
-        let sysroot_include = format!("{}/usr/include", sysroot);
-        let sysroot_triple_include = format!("{}/usr/include/{}", sysroot, include_target);
+        let sysroot = sysroot_base.join("sysroot");
+        let sysroot_include = sysroot.join("usr").join("include");
+        let sysroot_triple_include = sysroot_include.join(include_target);
+
         let clang_version = detect_clang_version(&sysroot_base)
             .unwrap_or_else(|| {
                 eprintln!("Warning: Could not detect Clang version, using common paths only");
                 String::new()
             });
 
-        eprintln!("target={}{}", clang_target, clang_version);
-        eprintln!("sysroot={}", sysroot);
-        eprintln!("sysroot_include={}", sysroot_include);
-        eprintln!("sysroot_triple_include={}", sysroot_triple_include);
+        eprintln!("target={}", clang_target, );
+        eprintln!("sysroot={}", sysroot.display());
+        eprintln!("sysroot_include={}", sysroot_include.display());
+        eprintln!("sysroot_triple_include={}", sysroot_triple_include.display());
 
-        if !Path::new(&sysroot).exists() {
-            panic!("Sysroot not found at: {}", sysroot);
+        if !sysroot.exists() {
+            panic!("Sysroot not found at: {}", sysroot.display());
         }
-        if !Path::new(&sysroot_include).exists() {
-            panic!("Sysroot include directory not found at: {}", sysroot_include);
+        if !sysroot_include.exists() {
+            panic!("Sysroot include directory not found at: {}", sysroot_include.display());
         }
-        if !Path::new(&sysroot_triple_include).exists() {
+        if !sysroot_triple_include.exists() {
             panic!(
                 "Architecture-specific include directory not found at: {}\n\
                  This may indicate an unsupported target or incorrect NDK installation.",
-                sysroot_triple_include
+                sysroot_triple_include.display()
+            );
+        }
+
+        let clang_builtin_include = sysroot_base
+            .join("lib")
+            .join("clang")
+            .join(&clang_version)
+            .join("include");
+
+        let sysroot_triple_asm = sysroot_triple_include.join("asm");
+
+        if !clang_builtin_include.exists() {
+            panic!(
+                "Clang builtin headers not found at: {}\nDetected version: {}",
+                clang_builtin_include.display(),
+                clang_version
             );
         }
 
         builder = builder
             .clang_arg(format!("--target={}{}", clang_target, clang_version))
-            .clang_arg(format!("--sysroot={}", sysroot))
-            .clang_arg(format!("-I{}", sysroot_include))
-            .clang_arg(format!("-I{}", sysroot_triple_include));
+            .clang_arg(format!("--sysroot={}", sysroot.display()))
+            .clang_arg(format!("-I{}", clang_builtin_include.display()))
+            .clang_arg(format!("-I{}", sysroot_triple_include.display()))
+            .clang_arg(format!("-I{}", sysroot_triple_asm.display()))
+            .clang_arg(format!("-I{}", sysroot_include.display()))
+            .clang_arg(format!("-resource-dir={}", sysroot_base.join("lib").join("clang").join(&clang_version).display()));
     }
 
     builder
@@ -133,16 +161,14 @@ pub fn write_bindings(include_paths: Vec<String>, out_path: &Path) {
         .expect("Unable to write bindings to file");
 }
 
-fn detect_clang_version(sysroot_base: &str) -> Option<String> {
-    let clang_lib_path = format!("{}/lib/clang", sysroot_base);
+fn detect_clang_version(sysroot_base: &Path) -> Option<String> {
+    let clang_lib_path = sysroot_base.join("lib").join("clang");
 
     if let Ok(entries) = std::fs::read_dir(&clang_lib_path) {
-        // Find the first directory that looks like a version number
         for entry in entries.flatten() {
             if let Ok(file_type) = entry.file_type() {
                 if file_type.is_dir() {
                     if let Some(name) = entry.file_name().to_str() {
-                        // Check if it's a version-like directory (starts with digit)
                         if name.chars().next().map_or(false, |c| c.is_ascii_digit()) {
                             eprintln!("Detected Clang version: {}", name);
                             return Some(name.to_string());
