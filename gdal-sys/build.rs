@@ -43,8 +43,20 @@ pub fn write_bindings(include_paths: Vec<String>, out_path: &Path) {
         let host_parts: Vec<&str> = host.split("-").collect();
 
         let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+
         let host_tag = if os == "macos" {
-            "darwin-x86_64".to_string()
+            if arch == "aarch64" || arch == "arm64" {
+                let arm64_path = format!("{}/toolchains/llvm/prebuilt/darwin-aarch64", ndk_path);
+                if Path::new(&arm64_path).exists() {
+                    "darwin-aarch64".to_string()
+                } else {
+                    eprintln!("Warning: Using x86_64 NDK toolchain on Apple Silicon (Rosetta 2 required)");
+                    "darwin-x86_64".to_string()
+                }
+            } else {
+                "darwin-x86_64".to_string()
+            }
         } else {
             format!("{}-{}", os, host_parts[0])
         };
@@ -60,29 +72,55 @@ pub fn write_bindings(include_paths: Vec<String>, out_path: &Path) {
             ndk_path, host_tag
         );
 
+        if !Path::new(&sysroot_base).exists() {
+            panic!(
+                "NDK toolchain not found at: {}\nPlease check your ANDROID_NDK_HOME/ANDROID_NDK path and host architecture.",
+                sysroot_base
+            );
+        }
+
         println!("cargo:rustc-env=LIBCLANG_PATH={}", llvm_bindir);
         println!("cargo:rustc-env=CLANG_PATH={}", llvm_bindir);
         println!("cargo:rerun-if-changed=wrapper.h");
 
-        let triple = match target.as_str() {
-            t if t.contains("aarch64") => "aarch64-linux-android",
-            t if t.contains("armv7") => "armv7a-linux-androideabi",
-            t if t.contains("i686") => "i686-linux-android",
-            t if t.contains("x86_64") => "x86_64-linux-android",
+        let (clang_target, include_target) = match target.as_str() {
+            t if t.contains("aarch64") => ("aarch64-linux-android", "aarch64-linux-android"),
+            t if t.contains("armv7") => ("armv7a-linux-androideabi", "arm-linux-androideabi"),
+            t if t.contains("i686") => ("i686-linux-android", "i686-linux-android"),
+            t if t.contains("x86_64") => ("x86_64-linux-android", "x86_64-linux-android"),
             _ => panic!("Unsupported Android target: {}", target),
         };
 
         let sysroot = format!("{}/sysroot", sysroot_base);
         let sysroot_include = format!("{}/usr/include", sysroot);
-        let sysroot_triple_include = format!("{}/usr/include/{}", sysroot, triple);
+        let sysroot_triple_include = format!("{}/usr/include/{}", sysroot, include_target);
+        let clang_version = detect_clang_version(&sysroot_base)
+            .unwrap_or_else(|| {
+                eprintln!("Warning: Could not detect Clang version, using common paths only");
+                String::new()
+            });
 
-        eprintln!("target={}", triple);
+        eprintln!("target={}{}", clang_target, clang_version);
         eprintln!("sysroot={}", sysroot);
         eprintln!("sysroot_include={}", sysroot_include);
         eprintln!("sysroot_triple_include={}", sysroot_triple_include);
 
+        if !Path::new(&sysroot).exists() {
+            panic!("Sysroot not found at: {}", sysroot);
+        }
+        if !Path::new(&sysroot_include).exists() {
+            panic!("Sysroot include directory not found at: {}", sysroot_include);
+        }
+        if !Path::new(&sysroot_triple_include).exists() {
+            panic!(
+                "Architecture-specific include directory not found at: {}\n\
+                 This may indicate an unsupported target or incorrect NDK installation.",
+                sysroot_triple_include
+            );
+        }
+
         builder = builder
-            .clang_arg(format!("--target={}", triple))
+            .clang_arg(format!("--target={}{}", clang_target, clang_version))
             .clang_arg(format!("--sysroot={}", sysroot))
             .clang_arg(format!("-I{}", sysroot_include))
             .clang_arg(format!("-I{}", sysroot_triple_include));
@@ -93,6 +131,29 @@ pub fn write_bindings(include_paths: Vec<String>, out_path: &Path) {
         .expect("Unable to generate bindings")
         .write_to_file(out_path)
         .expect("Unable to write bindings to file");
+}
+
+fn detect_clang_version(sysroot_base: &str) -> Option<String> {
+    let clang_lib_path = format!("{}/lib/clang", sysroot_base);
+
+    if let Ok(entries) = std::fs::read_dir(&clang_lib_path) {
+        // Find the first directory that looks like a version number
+        for entry in entries.flatten() {
+            if let Ok(file_type) = entry.file_type() {
+                if file_type.is_dir() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        // Check if it's a version-like directory (starts with digit)
+                        if name.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                            eprintln!("Detected Clang version: {}", name);
+                            return Some(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn env_dir(var: &str) -> Option<PathBuf> {
